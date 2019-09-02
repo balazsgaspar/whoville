@@ -2,16 +2,16 @@
 # Hive LLAP will not start on small machines
 # NiFi moved to 9092 to avoid a port clash when everything is on one node
 
-desc: Single node cluster including HDP-3.1 & HDF-3.3.0
+desc: Single noderunning CEM, Nifi and Minifi on K8s
 deploywait: 1800
-purge: true
+purge: false
 priority: 
 seq:
-- copy_def: [inf-hdp31-single, citibike-demo]
-- merge_def: [demo-citibike, citibike-demo]
-- prep_deps: [citibike-demo, citibike-demo]
-- prep_spec: [citibike-demo, citibike-demo]
-- do_builds: [citibike-demo]
+- copy_def: [inf-hdp31-single, splunk-optimization]
+- merge_def: [demo-splunk-optimization, splunk-optimization]
+- prep_deps: [splunk-optimization, splunk-optimization]
+- prep_spec: [splunk-optimization, splunk-optimization]
+- do_builds: [splunk-optimization]
 input:
   yarn.vcores: 16
   yarn.capacity: 60000

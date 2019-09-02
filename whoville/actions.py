@@ -34,10 +34,14 @@ def prep_spec(args):
         deploy.prep_stack_specs(def_key, shortname)
     elif 'director' in _horton.defs[def_key]['orchestrator']:
         fullname = _horton.namespace + shortname
+        scripts = copy.deepcopy(_horton.resources[def_key])
+        _ = scripts.pop(def_key + '.yaml')
         _horton.specs[fullname] = {
-            'cdh_ver': _horton.defs[def_key]['version'],
-            'services': _horton.defs[def_key]['services'],
-            'tls_start': _horton.defs[def_key]['tls_start']
+            'cm_ver': str(_horton.defs[def_key]['cmver']),
+            'tls_start': _horton.defs[def_key]['tls_start'],
+            'csds': _horton.defs[def_key]['csds'] if 'csds' in _horton.defs[def_key] else None,
+            'clusters': _horton.defs[def_key]['clusters'],
+            'scripts': scripts
         }
     else:
         raise ValueError("Orchestrator not supported")
@@ -58,13 +62,15 @@ def do_builds(args):
                 _datetime.utcnow(),
                 600
             )
-        elif 'cdh_ver' in _horton.specs[fullname]:
+        elif 'cm_ver' in _horton.specs[fullname]:
             # Using Director
             director.chain_deploy(
-                cdh_ver=str(_horton.specs[fullname]['cdh_ver']),
+                cm_ver=str(_horton.specs[fullname]['cm_ver']),
                 dep_name=fullname,
-                services=_horton.specs[fullname]['services'],
+                clusters=_horton.specs[fullname]['clusters'],
                 tls_start=_horton.specs[fullname]['tls_start'],
+                csds=_horton.specs[fullname]['csds'],
+                scripts=_horton.specs[fullname]['scripts']
             )
         else:
             raise ValueError("Orchestrator not supported")
@@ -107,6 +113,32 @@ def write_cache(args):
     target = args[1]
     cache_key = args[2]
     deploy.write_cache(fullname, target, cache_key)
+
+
+def upload_recipe_to_k8s(args):
+    target_host_name = [x for x in _horton.k8svm if 'master' in x][0]
+    if isinstance(_horton.k8svm[target_host_name], list):
+        target_host_ip = _horton.k8svm[target_host_name][0].public_ips[0]
+    else:
+        target_host_ip = _horton.k8svm[target_host_name].public_ips[0]    
+    payload = _horton.resources[args[0]][args[1]]
+    cmd = 'tee /tmp/' + args[1] + ' <<-\'END\'\n' + payload + '\nEND'
+    utils.execute_remote_cmd(target_host_ip, cmd, expect=None,
+                             repeat=False, bool_response=False)
+    cmd = 'chmod 755 /tmp/' + args[1]
+    utils.execute_remote_cmd(target_host_ip, cmd, expect=None,
+                             repeat=False, bool_response=False)
+
+
+def exec_recipe_on_k8s(args):
+    target_host_name = [x for x in _horton.k8svm if 'master' in x][0]
+    if isinstance(_horton.k8svm[target_host_name], list):
+        target_host_ip = _horton.k8svm[target_host_name][0].public_ips[0]
+    else:
+        target_host_ip = _horton.k8svm[target_host_name].public_ips[0]
+    cmd = 'sudo /tmp/' + args[1] + ' > /tmp/whoville.recipe.log 2>&1'
+    utils.execute_remote_cmd(target_host_ip, cmd, expect=None,
+                             repeat=False, bool_response=False)
 
 
 def replace_str(args):
@@ -187,6 +219,6 @@ def merge_def(args):
 
 
 def call_seq(args):
-    from whoville.mayor import step_4_build
+    from whoville.mayor import run_bundle
     def_key_to_build = args[0]
-    step_4_build(def_key_to_build)
+    run_bundle(def_key_to_build)

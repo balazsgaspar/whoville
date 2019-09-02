@@ -12,13 +12,13 @@ import logging
 import base64
 import re
 import sys
+from time import sleep
 from datetime import datetime, timedelta
 from calendar import timegm
 import json
 import six
 from whoville import config, utils, infra, security
 from whoville import cloudbreak as cb
-from whoville import __version__ as proj_ver
 from whoville.cloudbreak.rest import ApiException
 
 
@@ -74,7 +74,21 @@ def create_credential(from_profile=False, platform='EC2', name=None,
                       params=None, **kwargs):
     if from_profile:
         platform = config.profile.get('platform')
-        if platform['provider'] == 'EC2':
+        if platform['provider'] == 'OPENSTACK':
+            service = platform['provider']
+            sub_params = {
+                "endpoint": platform['auth_url'] + "/v3",
+                "facing": "internal",
+                "keystoneAuthScope": "cb-keystone-v3-project-scope",
+                "selector": "cb-keystone-v3-project-scope",
+                "keystoneVersion": "cb-keystone-v3",
+                "password": platform['password'],
+                "userDomain": "Default",
+                "userName": platform['username'],
+                "projectDomainName": "Default",
+                "projectName": platform['project'].upper()
+            }
+        elif platform['provider'] == 'EC2':
             service = 'AWS'
             if 'credarn' in platform:
                 sub_params = {
@@ -133,15 +147,32 @@ def create_credential(from_profile=False, platform='EC2', name=None,
                                  selector, platform)
         else:
             raise ValueError("Platform [%s] unsupported", platform)
-    return cb.V1credentialsApi().post_private_credential(
-        body=cb.CredentialRequest(
-            cloud_platform=service,
-            description=name,
-            name=name,
-            parameters=sub_params
-        ),
-        **kwargs
-    )
+
+    try:
+        out = cb.V1credentialsApi().post_private_credential(
+            body=cb.CredentialRequest(
+                cloud_platform=service,
+                description=name,
+                name=name,
+                parameters=sub_params
+            ),
+            **kwargs
+        )
+    except ApiException as e:
+        log.info("Credential service returned an error, waiting 5 sec to retry")
+        sleep(5)
+        out = cb.V1credentialsApi().post_private_credential(
+            body=cb.CredentialRequest(
+                cloud_platform=service,
+                description=name,
+                name=name,
+                parameters=sub_params
+            ),
+            **kwargs
+        )
+    if not out:
+        raise ValueError("Could not create Credential with Cloudbreak")
+    return out
 
 
 def get_credential(name, create=False, purge=False, **kwargs):
@@ -866,8 +897,13 @@ def prep_instance_groups(def_key, fullname):
         region = horton.specs[fullname].placement.region
         avzone = horton.specs[fullname].placement.availability_zone
     except AttributeError:
-        region = horton.cbd.extra['zone'].extra['region']
-        avzone = horton.cbd.extra['zone'].name
+        if 'zone' in horton.cbd.extra:
+            region = horton.cbd.extra['zone'].extra['region']
+            avzone = horton.cbd.extra['zone'].name
+        else:
+            # Defaulting to OpenStack defaults as a backup
+            region = 'RegionOne'
+            avzone = horton.cbd.extra['availability_zone']
 
     log.info("Fetching Infrastructure recommendation for "
              "credential[%s]:blueprint[%s]:region[%s]:availability zone[%s]",
@@ -892,8 +928,10 @@ def prep_instance_groups(def_key, fullname):
     elif horton.cbcred.cloud_platform == 'GCP':
         sec_group = lib_c_session.ex_get_firewall(
             name=horton.namespace + 'cloudbreak-firewall').name
+    elif horton.cbcred.cloud_platform == 'OPENSTACK':
+        sec_group = lib_c_session.ex_get_node_security_groups(horton.cbd)[0].id
     else:
-        raise ValueError("Only Platforms AWS, AZURE, and GCP supported")
+        raise ValueError("Only Platforms AWS, AZURE, OpenStack, and GCP supported")
     if sec_group:
         # Predefined Security Group
         sec_group = cb.SecurityGroupResponse(
@@ -916,6 +954,7 @@ def prep_instance_groups(def_key, fullname):
             group_def = {}
         nodes = group_def['nodes'] if 'nodes' in group_def else 1
         machine = group_def['machine'] if 'machine' in group_def else None
+        log.info("Finding a machine type matching spec [%s]", machine)
         machine_range = machine.split('-')
         machine_min = machine_range[0]
         machine_max = machine_range[1]
@@ -924,36 +963,36 @@ def prep_instance_groups(def_key, fullname):
         min_mem = float(machine_min.split('x')[1])
         max_mem = float(machine_max.split('x')[1])
         sizes = recs.virtual_machines
-        machines = [
+        machines_by_size = [
             x for x in sizes
             if min_cpu <= int(x.vm_type_meta_json.properties['Cpu']) <= max_cpu
             and min_mem <= float(x.vm_type_meta_json.properties['Memory']) <= max_mem
         ]
-        if not machines:
+        if not machines_by_size:
             raise ValueError("Couldn't find a VM of the right size")
         else:
             if horton.cbcred.cloud_platform == 'AZURE':
                 machines = [
-                    x for x in machines
+                    x for x in machines_by_size
                     if ('Standard_D' in x.value or 'Standard_DS' in x.value)
                     and 'v2' in x.value
                     and 'Promo' not in x.value
                 ]
-                machine = machines[0].value
             elif horton.cbcred.cloud_platform == 'AWS':
                 machines = [
-                    x for x in machines
+                    x for x in machines_by_size
                     if 'm4.' in x.value or 'm5.' in x.value
                 ]
-                machine = machines[0].value
-            elif horton.cbcred.cloud_platform == 'GCP':
+            else:  # GCP
                 machines = [
-                    x for x in machines
+                    x for x in machines_by_size
                     if 'n' in x.value
                 ]
+            if machines:
                 machine = machines[0].value
             else:
-                machine = machines[0].value
+                log.info("Machine list does not contain expected types: %s", str(machines_by_size))
+                raise ValueError("Could not find a machine type matching demo spec for %s", group)
 
         if 'recipe' in group_def and group_def['recipe'] is not None:
             # convert to set and back again to only use unique list of recipes as duplicates may be introduced during
@@ -1031,28 +1070,7 @@ def prep_stack_specs(def_key, name=None):
         general='', instance_groups=''
     )
     
-    tags = config.profile.get('tags')
-    if tags is not None:
-        if 'deployer' not in tags or tags['deployer'] is None:
-            tags['deployer'] = horton.cbcred.name
-        if 'startdate' not in tags or tags['startdate'] is None:
-            tags['startdate'] = str(datetime.now().strftime("%d%b%Y").lower())
-        if 'enddate' not in tags or tags['enddate'] is None:
-            tags['enddate'] = str(
-                (datetime.now() + timedelta(days=2)).strftime("%d%b%Y").lower())
-        if 'service' not in tags or tags['service'] is None:
-            tags['service'] = 'ephemeralhortonworkscluster'
-        if 'deploytool' not in tags or tags['deploytool'] is None:
-            tags['deploytool'] = 'whoville' + proj_ver
-        tags['dps'] = 'false'
-        tags['datalake'] = 'false'
-    else:
-        tags = {'datalake': 'false', 'dps': 'false'}
-    
-    if 'dps' in fullname:
-        tags['dps'] = 'true'
-    if 'datalake' in fullname:
-        tags['datalake'] = 'true'
+    tags = utils.resolve_tags(instance_name=fullname, owner=config.profile['tags']['owner'])
     
     horton.specs[fullname].tags = {'userDefinedTags': tags}
     
@@ -1244,20 +1262,29 @@ def monitor_event_stream(start_ts, identity, target_event, valid_events):
     )
     event_set = set([x.__getattribute__(target_event[0])
                      for x in events])
-    log.info("Found event set [%s] for target event [%s]",
-             str(event_set), target_event[0])
     if not event_set:
         log.warning("No Events received in the last interval, if this "
                     "persists please check the identity and target event "
                     "against Cloudbreak")
+    else:
+        log.info("Retrieved updated events %s, waiting for target event %s",
+                 str(event_set), target_event[0])
     if target_event[1] in event_set:
         return True
-    valid_test = [x for x in event_set if x not in valid_events]
+    valid_test = [
+        x for x in events
+        if x.__getattribute__(target_event[0]) not in valid_events
+    ]
     if valid_test:
         raise ValueError(
             "Found Event {0} for Identity {1} which is not in Valid Event "
-            "list {2}"
-            .format(str(valid_test), str(identity), str(valid_events)))
+            "list {2}. Error message is: {3}".format(
+                str(valid_test[0].__getattribute__(target_event[0])),
+                str(identity),
+                str(valid_events),
+                str(valid_test[0].event_message)
+            )
+        )
     return False
 
 
@@ -1628,13 +1655,11 @@ def write_cache(name, item, cache_key):
                     x for x in group.metadata if x.ambari_server is True][0]
                 horton.cache[cache_key] = instance.__getattribute__(item)
     elif item in ['shared_services']:
-        stack = [x for x in list_stacks()
-                if x.user_defined_tags['datalake'] == 'true'][0]
+        stack = [x for x in list_stacks() if x.user_defined_tags['datalake'] == 'true'][0]
         if stack:
             horton.cache[cache_key] = stack.cluster.name
     elif item in ['cdsw_ip']:
-        stack = [x for x in list_stacks()
-                 if x.name == name][0]
+        stack = [x for x in list_stacks() if x.name == name][0]
         if stack:
             group = [
                 x for x in stack.instance_groups
@@ -1644,9 +1669,9 @@ def write_cache(name, item, cache_key):
                     x for x in group.metadata if 'cdsw' in x.instance_group][0]
                 horton.cache[cache_key] = instance.__getattribute__('public_ip')
             else:
-                log.error("CDSWIP requested but not found")
+                raise ValueError("CDSWIP requested but not found")
         else:
-            log.error("CDSWIP requested but not found")
+            raise ValueError("CDSWIP requested but not found")
     else:
         # write literal value to cache
         horton.cache[cache_key] = item

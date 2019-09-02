@@ -14,6 +14,8 @@ import copy
 import base64
 import six
 from six.moves import reduce
+from time import sleep
+from datetime import datetime, timedelta
 import os
 import ruamel.yaml
 import requests
@@ -21,13 +23,12 @@ from github import Github
 from github.GithubException import UnknownObjectException
 from requests.models import Response
 from whoville import config, security
-import pexpect
 from pexpect import pxssh
 from pexpect.exceptions import EOF
 from pexpect.pxssh import ExceptionPxssh
 
-__all__ = ['dump', 'load', 'fs_read', 'fs_write', 'wait_to_complete',
-           'is_endpoint_up', 'set_endpoint', 'get_val',
+__all__ = ['dump', 'load', 'fs_read', 'fs_write', 'wait_to_complete', 'check_remote_success_file',
+           'is_endpoint_up', 'set_endpoint', 'get_val', 'get_remote_shell', 'execute_remote_cmd',
            'load_resources_from_files', 'load_resources_from_github', 'Horton'
            ]
 
@@ -184,13 +185,13 @@ def wait_to_complete(test_function, *args, **kwargs):
         test_result = test_function(*args, **kwargs)
         log.debug("Checking result")
         if test_result:
-            log.info("Function output [%s] eval to True, returning output",
+            log.debug("Function output [%s] eval to True, returning output",
                      str(test_result)[:25])
             return test_result
-        log.info("Function output [%s] evaluated to False, sleeping...",
+        log.debug("Function output [%s] evaluated to False, sleeping...",
                  str(test_result)[:25])
         time.sleep(delay)
-    log.info("Hit Timeout, raising TimeOut Error")
+    log.debug("Hit Timeout, raising TimeOut Error")
     raise ValueError("Timed Out waiting for {0} to complete".format(
         test_function.__name__))
 
@@ -219,28 +220,83 @@ def is_endpoint_up(endpoint_url, verify=False):
         log.info("Got ConnectionError, returning False")
         return False
 
-def is_remote_file_present(target_host, user_name='centos', ssh_key_path='/tmp/key.pem', verify=False):
-    log.info("Called is_remote_file_present with args %s", locals())
-    try:
-        s = pxssh.pxssh(options={"StrictHostKeyChecking": "no",
-                    "UserKnownHostsFile": "/dev/null"})
-        s.login(target_host,user_name,ssh_key=ssh_key_path,check_local_ip=False,)
-        s.sendline('cat /tmp/status.success')
-        s.prompt()
-        response=s.before.decode()
-        response=response.split('\r\n')
-        if '' in response:
-            response.remove('')
-        response=response[len(response)-1]
-        if len(response) > 0 and response == 'complete':
-            log.info("Found .success file, ready to proceed")
-            return True
+
+def get_remote_shell(target_host, sshkey_file=None, user_name=None, wait=True):
+    log.info("Getting remote shell for target host [%s]", target_host)
+    horton = Horton()
+    log.debug("Checking cache for existing Shell session to host")
+    shell = horton.shells[target_host] if target_host in horton.shells else None
+    if shell:
+        if not shell.isalive():
+            log.debug("Cached shell is not live, recreating")
+            shell = None
         else:
-            log.info("Could not find .success file")
+            return shell
+    if not shell:
+        log.debug("Creating new session")
+        sshkey_file = sshkey_file if sshkey_file else config.profile['sshkey_file']
+        user_name = user_name if user_name else 'centos'
+        while not shell:
+            try:
+                shell = pxssh.pxssh(options={"StrictHostKeyChecking": "no", "UserKnownHostsFile": "/dev/null"})
+                shell.login(target_host, user_name, ssh_key=sshkey_file, check_local_ip=False)
+            except (ExceptionPxssh, EOF):
+                if not wait:
+                    log.info("Target host is not accepting the connection, Wait is not set, returning False...")
+                    return False
+                else:
+                    log.info("Retrying until target host accepts the connection request...")
+                    sleep(5)
+            horton.shells[target_host] = shell
+            log.info("Returning Shell session...")
+    return shell
+
+
+def execute_remote_cmd(target_host, cmd, expect=None, repeat=False, bool_response=False):
+    log.info("Executing remote command [%s] on host [%s] expecting output of [%s] with wait-repeat of [%s] and "
+             "bool_response of [%s]", cmd[:100], target_host, str(expect), str(repeat), str(bool_response))
+    assert isinstance(cmd, six.string_types)
+    assert expect is None or isinstance(expect, six.string_types)
+    assert isinstance(repeat, bool)
+    assert isinstance(bool_response, bool)
+    if bool_response and not expect:
+        raise ValueError("Must include an Expect statement with bool_response test")
+    s = get_remote_shell(target_host, wait=not bool_response)
+    if not s:
+        if bool_response:
+            log.info("Remote Shell not currently available, bool_respose is set, returning False")
             return False
-    except (ExceptionPxssh, EOF):
-        log.info("Target host is not ready to accept connections")
+        else:
+            raise ValueError('Remote Shell not available to host [%s]', target_host)
+    log.debug("Issuing command [%s]", cmd)
+    s.sendline(cmd)
+    s.prompt()
+    if not expect:
+        log.info("Expect not set, returning command result...")
+        return s.before.decode()
+    while expect not in s.before.decode():
+        if bool_response:
+            return False
+        log.info("Expect set and string not found in response, waiting...")
+        sleep(3)
+        s.prompt()
+        if repeat:
+            log.info("Repeat set, reissuing command before checking again")
+            s.sendline(cmd)
+    log.info("Expect set and found in command response, returning response")
+    return s.before.decode()
+
+
+def check_remote_success_file(target_host, check_file='/tmp/status.success'):
+
+    response = execute_remote_cmd(target_host, 'cat ' + check_file)
+    if 'complete' in response:
+        log.info("Found complete in .success file, ready to proceed")
+        return True
+    else:
+        log.info("Could not find .success file")
         return False
+
 
 def set_endpoint(endpoint_url):
     """
@@ -257,19 +313,19 @@ def set_endpoint(endpoint_url):
     """
     log.info("Called set_endpoint with args %s", locals())
     if 'cb/api' in endpoint_url:
-        log.info("Setting Cloudbreak endpoint to %s", endpoint_url)
+        log.debug("Setting Cloudbreak endpoint to %s", endpoint_url)
         this_config = config.cb_config
     elif ':7189' in endpoint_url:
-        log.info("Setting Altus Director endpoint to %s", endpoint_url)
+        log.debug("Setting Altus Director endpoint to %s", endpoint_url)
         this_config = config.cd_config
     else:
         raise ValueError("Unrecognised API Endpoint")
     try:
         if this_config.api_client:
-            log.info("Found Active API Client, updating...")
+            log.debug("Found Active API Client, updating...")
             this_config.api_client.host = endpoint_url
     except AttributeError:
-        log.info("No Active API Client found to update")
+        log.debug("No Active API Client found to update")
     this_config.host = endpoint_url
     if this_config.host == endpoint_url:
         return True
@@ -405,20 +461,20 @@ def load_resources_from_files(file_path):
     resources = {}
     # http://code.activestate.com/recipes/577879-create-a-nested-dictionary-from-oswalk/
     rootdir = file_path.rstrip(os.sep)
-    log.info("Trying path {0}".format(rootdir))
+    log.debug("Trying path {0}".format(rootdir))
     head = rootdir.rsplit(os.sep)[-1]
     start = rootdir.rfind(os.sep) + 1
     for path, dirs, files in os.walk(rootdir):
-        log.info("Trying path {0}".format(path))
+        log.debug("Trying path {0}".format(path))
         folders = path[start:].split(os.sep)
         subdir = dict.fromkeys(files)
         parent = reduce(dict.get, folders[:-1], resources)
         parent[folders[-1]] = subdir
         for file_name in subdir.keys():
             if file_name[0] == '.':
-                log.info("skipping dot file [%s]", file_name)
+                log.debug("skipping dot file [%s]", file_name)
             else:
-                log.info("loading [%s]", os.path.join(path, file_name))
+                log.debug("loading [%s]", os.path.join(path, file_name))
             if file_name.rsplit('.')[1] not in ['yaml', 'json']:
                 subdir[file_name] = fs_read(os.path.join(path, file_name))
             else:
@@ -456,6 +512,7 @@ class Horton:
         self.cbcred = None  # Credential for deployments, once loaded in CB
         self.cdcred = None  # Credential for deployments, once loaded in CD
         self.cad = None  # Client for Altus Director, once created
+        self.k8svm = {}  # Reference for K8s environment, once created
         self.resources = {}  # all loaded resources from github/files
         self.defs = {}  # deployment definitions, once pulled from resources
         self.specs = {}  # stack specifications, once formulated
@@ -463,8 +520,9 @@ class Horton:
         self.deps = {}  # Dependencies loaded for a given Definition
         self.seq = {}  # Prioritised list of tasks to execute
         self.cache = {}  # Key:Value store for passing params between Defs
+        self.shells = {}  # Key:Value session store for remote shells
         self.namespace = config.profile['namespace']
-        self.global_purge = config.profile['globalpurge']
+        self.global_purge = config.profile['globalpurge'] if 'globalpurge' in config.profile else False
 
     def __iter__(self):
         for attr, value in self.__dict__.items():
@@ -490,6 +548,7 @@ class Horton:
 def validate_profile():
     log.info("Validating provided profile.yml")
     horton = Horton()
+    # TODO: Check VPN if OpenStack
     # Check Profile is imported
     if not config.profile:
         raise ValueError("whoville Config Profile is not populated with"
@@ -528,22 +587,59 @@ def validate_profile():
                          "Requires 12+ characters, at least 1 letter and "
                          "number, may also contain -")
     # Check Provider
-    provider = config.profile.get('platform')['provider']
-    assert provider in ['EC2', 'AZURE_ARM', 'GCE']
+    platform = config.profile.get('platform')
+    assert platform['provider'] in ['EC2', 'AZURE_ARM', 'GCE', 'OPENSTACK']
+    if platform['provider'] == 'GCE':
+        if 'apikeypath' in platform:
+            with open(platform['apikeypath'], "r") as apikey:
+                platform['jsonkey'] = apikey.read()
     # TODO: Read in the profile template, check it has all matching keys
-    # Check Profile Namespace is validate
+    # Check Profile Namespace is valid
     ns_test = re.compile(r'[a-z0-9-]')
     if not bool(ns_test.match(horton.namespace)):
         raise ValueError("Namespace must only contain 0-9 a-z -")
     # Check storage bucket matches expected format
     if 'bucket' in config.profile:
-        if provider == 'EC2':
+        if platform['provider'] == 'EC2':
             bucket_test = re.compile(r'[a-z0-9.-]')
-        elif provider == 'AZURE_ARM':
+        elif platform['provider'] == 'AZURE_ARM':
             bucket_test = re.compile(r'[a-z0-9@]')
-        elif provider == 'GCE':
+        elif platform['provider'] == 'GCE':
             bucket_test = re.compile(r'[a-z0-9.-]')
         else:
-            raise ValueError("Platform Provider not supported")
+            raise ValueError("bucket listed in Profile but Platform Provider not supported")
         if not bool(bucket_test.match(config.profile['bucket'])):
             raise ValueError("Bucket name doesn't match Platform spec")
+    # check tags
+    if 'tags' not in config.profile:
+        raise ValueError("Profile is missing mandatory tags entries")
+    tags = config.profile['tags']
+    for tag in ['owner']:
+        assert tag in tags, "tag {0} missing from profile".format(tag)
+        assert isinstance(tag, six.string_types) and len(tag) > 3, "Tag {0} must be a string over 3 chars".format(tag)
+
+
+def resolve_tags(instance_name, owner):
+    tags = config.profile.get('tags')
+    if tags is not None:
+        if 'owner' not in tags or tags['owner'] is None:
+            tags['owner'] = owner
+        if 'startdate' not in tags or tags['startdate'] is None:
+            tags['startdate'] = str(datetime.now().strftime("%m%d%Y").lower())
+        if 'enddate' not in tags or tags['enddate'] is None:
+            tags['enddate'] = str(
+                (datetime.now() + timedelta(days=2)).strftime("%m%d%Y").lower())
+        if 'project' not in tags or tags['project'] is None:
+            tags['project'] = 'selfdevelopment'
+        if 'deploytool' not in tags or tags['deploytool'] is None:
+            tags['deploytool'] = 'whoville'
+        tags['dps'] = 'false'
+        tags['datalake'] = 'false'
+    else:
+        tags = {'datalake': 'false', 'dps': 'false'}
+
+    if 'dps' in instance_name:
+        tags['dps'] = 'true'
+    if 'datalake' in instance_name:
+        tags['datalake'] = 'true'
+    return tags

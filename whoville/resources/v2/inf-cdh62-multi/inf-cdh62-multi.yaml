@@ -1,0 +1,14 @@
+desc: Multi node cluster with Simple CDH-6.2 install
+orchestrator: director
+purge: false
+deploywait: 1800
+seq:
+- prep_spec: [inf-cdh62-multi, cdh62-m]
+- do_builds: [cdh62-m]
+cmver: 6.2
+tls_start: True
+clusters:
+  - name: cdh62multi
+    products:
+      CDH: 6.2
+    services: [HDFS, YARN, IMPALA, KUDU, HBASE, HIVE, ZOOKEEPER]

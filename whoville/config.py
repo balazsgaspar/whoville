@@ -24,8 +24,10 @@ if sys.version_info < MIN_PYTHON:
 
 # --- Profile File Name ------
 profile_loc = os.environ.get("PROFILE")
-if not profile_loc:
-    profile_loc = 'profile.yml'
+if profile_loc is None:
+    profile_loc = ['/profile.yml', 'profile.yml']
+else:
+    profile_loc = [profile_loc]
 
 
 # --- Project Root -----
@@ -76,9 +78,56 @@ if not cb_config.verify_ssl:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
+# Default Firewall Rules
+default_net_rules = [
+        {
+            'protocol': 'tcp',  # required for Cloudbreak
+            'from_port': 9443,
+            'to_port': 9443,
+            'cidr_ips': ['0.0.0.0/0'],
+            'description': 'Cloudbreak'
+        },
+        {
+            'protocol': 'tcp',  # high port secured access
+            'from_port': 7189,
+            'to_port': 7189,
+            'cidr_ips': ['0.0.0.0/0'],
+            'description': 'Director PublicIP'
+        },
+        {
+            'protocol': 'tcp',  # high port secured access
+            'from_port': 8443,
+            'to_port': 8443,
+            'cidr_ips': ['0.0.0.0/0'],
+            'description': 'Dataplane PublicIP'
+        },
+        {
+            'protocol': 'tcp',  # general secured access
+            'from_port': 443,
+            'to_port': 443,
+            'cidr_ips': ['0.0.0.0/0'],
+            'description': 'SSL'
+        },
+        {
+            'protocol': 'tcp',  # general secured access
+            'from_port': 8080,
+            'to_port': 8080,
+            'cidr_ips': ['0.0.0.0/0'],
+            'description': 'Ambari'
+        }
+    ]
+
 # Resolve Configuration overrides from local profile
-try:
-    with open(str(profile_loc), 'r') as f:
-        profile = safe_load(f.read())
-except IOError as e:
+profile = None
+for p in profile_loc:
+    print("Trying profile path ", p)
+    try:
+        with open(str(p), 'r') as f:
+            profile = safe_load(f.read())
+    except IOError as e:
+        print("Profile not found at ", p)
+    if profile:
+        print("Found Profile at ", p)
+        break
+if not profile:
     raise IOError("profile.yml not found - Have you set your Profile up?")

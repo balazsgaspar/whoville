@@ -1,7 +1,6 @@
-desc: Two node Service including HDP-3.1 & CDSW-1.5
+desc: HDP-3.1, NiFi, & CDSW-1.5 cluster with 2m5w
 deploywait: 1800
 purge: true
-priority: 
 seq:
 - copy_def: [inf-hdp31-single, hdp31-cdsw15-s]
 - merge_def: [demo-cdsw-hdp31, hdp31-cdsw15-s]
@@ -15,23 +14,29 @@ input:
   yarn.vcores: 20
   yarn.capacity: 60000
 recipe:
+- name: install-dependency-packages.sh
+  typ: PRE_AMBARI_START
 - name: cdsw-postcluster.sh
   typ: POST_CLUSTER_INSTALL
 group:
+  master:
+    recipe: [install-dependency-packages]
+    type: GATEWAY
   cdswmaster:
     recipe: [cdsw-postcluster]
     type: CORE
-    machine: 16x60-16x66
-    rootvol: 100
+    machine: 8x32-16x66
+    rootvol: 150
     vols: 2x500
   worker:
+    recipe: [install-dependency-packages]
     type: CORE
     machine: 4x28-8x32
     nodes: 3
 mpack:
 - name: hdf
-  desc: HDF 3.3.1
-  url: http://s3.amazonaws.com/dev.hortonworks.com/HDF/centos7/3.x/BUILDS/3.3.1.0-10/tars/hdf_ambari_mp/hdf-ambari-mpack-3.3.1.0-10.tar.gz
+  desc: HDF 3.4.1.1
+  url: http://public-repo-1.hortonworks.com/HDF/centos7/3.x/updates/3.4.1.1/tars/hdf_ambari_mp/hdf-ambari-mpack-3.4.1.1-4.tar.gz
   purge_on_install: false
 - name: hdp-search
   desc: HDP Search 4.0.0

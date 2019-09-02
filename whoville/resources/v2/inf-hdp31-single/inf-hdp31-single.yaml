@@ -2,7 +2,7 @@
 # Hive LLAP will not start on small machines
 # NiFi moved to 9092 to avoid a port clash when everything is on one node
 
-desc: Single node cluster including HDP-3.1 & HDF-3.3
+desc: Single node cluster including HDP-3.1
 deploywait: 1800
 purge: true
 priority: 
@@ -27,7 +27,7 @@ input:
 blueprint:
   name: blueprint.json
 group:
-  master1:
+  master:
     machine: 4x28-8x32
     recipe: [pre-ambari-configs]
     type: GATEWAY

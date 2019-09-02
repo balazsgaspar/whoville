@@ -2,16 +2,16 @@
 # Hive LLAP will not start on small machines
 # NiFi moved to 9092 to avoid a port clash when everything is on one node
 
-desc: Single node cluster including HDP-3.1 & HDF-3.3.0
+desc: Single node cluster for running cdf-workshops
 deploywait: 1800
-purge: true
+purge: false
 priority: 
 seq:
-- copy_def: [inf-hdp31-single, citibike-demo]
-- merge_def: [demo-citibike, citibike-demo]
-- prep_deps: [citibike-demo, citibike-demo]
-- prep_spec: [citibike-demo, citibike-demo]
-- do_builds: [citibike-demo]
+- copy_def: [inf-hdp31-single, workshop]
+- merge_def: [cdf-workshop, workshop]
+- prep_deps: [workshop, workshop]
+- prep_spec: [workshop, workshop]
+- do_builds: [workshop]
 input:
   yarn.vcores: 16
   yarn.capacity: 60000
